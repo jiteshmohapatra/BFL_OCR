@@ -161,27 +161,26 @@ from telegram.ext import (
     filters,
 )
 
-# Load environment variables
+# Load env variables
 load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 AZURE_ENDPOINT = os.getenv("AZURE_VISION_ENDPOINT")
 AZURE_KEY = os.getenv("AZURE_VISION_KEY")
 API_URL = AZURE_ENDPOINT + 'vision/v3.2/read/analyze'
 
-# Configure logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 
-# In-memory image storage
+# Image storage
 user_images = {}
 
-# /start command handler
+# /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📸 Now send any receipt image (PhonePe, GPay, Paytm, Amazon Pay, handwritten etc).\n\n"
-        "I’ll extract and organize the info for you!"
+        "👋 Hello! Send me any receipt image (PhonePe, GPay, Paytm, etc). I’ll extract and format the details for you."
     )
 
-# Image handler
+# Handle receipt image
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo = update.message.photo[-1]
@@ -195,7 +194,8 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("🔵 Google Pay", callback_data="GooglePay")],
             [InlineKeyboardButton("🟡 Amazon Pay", callback_data="AmazonPay"),
              InlineKeyboardButton("✍️ Handwritten", callback_data="Handwritten")],
-            [InlineKeyboardButton("📦 Other", callback_data="Other")]
+            [InlineKeyboardButton("🔷 Paytm", callback_data="Paytm"),
+             InlineKeyboardButton("📦 Other", callback_data="Other")]
         ])
 
         await update.message.reply_text(
@@ -204,46 +204,18 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        logging.error(f"Error handling image: {e}")
-        await update.message.reply_text("⚠️ Something went wrong while processing the image.")
+        logging.error(f"Image Upload Error: {e}")
+        await update.message.reply_text("⚠️ Error processing image. Please try again.")
 
-# Receipt type button handler
-async def handle_receipt_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        query = update.callback_query
-        await query.answer()
-        receipt_type = query.data
-        user_id = query.from_user.id
-
-        if user_id not in user_images:
-            await query.edit_message_text("❌ No image found. Please upload the receipt again.")
-            return
-
-        image_bytes = user_images.pop(user_id)
-        image_stream = BytesIO(image_bytes)
-
-        text = extract_text_from_image(image_stream)
-        if not text:
-            await query.edit_message_text("❌ No text detected in the image.")
-            return
-
-        formatted = organize_text(text, receipt_type)
-        await query.edit_message_text(f"📂 You selected: *{receipt_type}*\n\n{formatted}", parse_mode='Markdown')
-
-    except Exception as e:
-        logging.error(f"Error in callback: {e}")
-        await query.edit_message_text("⚠️ Failed to process the receipt type.")
-
-# Azure OCR integration
+# Azure OCR
 def extract_text_from_image(image_stream):
     headers = {
         'Ocp-Apim-Subscription-Key': AZURE_KEY,
         'Content-Type': 'application/octet-stream'
     }
-
     response = requests.post(API_URL, headers=headers, data=image_stream.getvalue())
     if response.status_code != 202:
-        logging.error(f"Azure OCR failed: {response.text}")
+        logging.error(f"Azure error: {response.text}")
         return None
 
     operation_url = response.headers['Operation-Location']
@@ -262,48 +234,134 @@ def extract_text_from_image(image_stream):
 
     return "\n".join(lines)
 
-# Format extracted text
+# Format text
 def organize_text(text, category):
     lines = text.splitlines()
+    if not lines or all(len(l.strip()) < 3 for l in lines):
+        return None  # poor image quality
+
     fields = {}
-    header = ""
     others = []
+    result = ""
 
-    for line in lines:
-        if ":" in line:
-            key, value = line.split(":", 1)
-            fields[key.strip().title()] = value.strip()
-        elif re.search(r'₹\s?\d+(\.\d+)?', line):
-            fields["Amount"] = line
-        elif re.search(r'\d{2}[-/]\d{2}[-/]\d{4}', line):
-            fields["Date"] = line
-        elif len(line.strip()) > 3 and not header:
-            header = line.strip()
-        else:
-            others.append(line.strip())
+    if category == "PhonePe":
+        header = "PhonePe Receipt Summary"
+        for line in lines:
+            if "₹" in line:
+                fields["Amount"] = line.strip()
+            elif "Transaction ID" in line:
+                fields["Transaction ID"] = line.split(":")[-1].strip()
+            elif "UTR" in line:
+                fields["UTR"] = line.split(":")[-1].strip()
+            elif re.match(r"(?i)^message[:\- ]", line.strip()):
+                fields["Message"] = line.split(":", 1)[-1].strip()
+            elif "Debited" in line:
+                fields["Debited From"] = line.replace("Debited from", "").strip()
+            elif re.search(r"\d{2}:\d{2}.*\d{2,4}", line):
+                fields["Date & Time"] = line.strip()
+            else:
+                others.append(line.strip())
 
-    result = f"🧾 *{header or 'Receipt'}*\n\n"
+    elif category == "Paytm":
+        header = "Paytm Receipt Summary"
+        amount = date_time = transaction_id = upi_ref = to_account = upi_id = ""
+        for line in lines:
+            if "₹" in line:
+                amount = line.strip()
+            elif re.search(r"\d{2}[:]\d{2}.*\d{2,4}", line):
+                date_time = line.strip()
+            elif re.match(r"^[A-Z0-9]{16,}$", line.strip()):
+                transaction_id = line.strip()
+            elif "Ref No" in line or "UPI Ref" in line:
+                upi_ref = line.split(":")[-1].strip()
+            elif "To:" in line:
+                to_account = line.replace("To:", "").strip()
+            elif "@" in line:
+                upi_id = line.strip()
+            else:
+                others.append(line.strip())
+        fields = {
+            "Amount Paid": amount,
+            "To Account": to_account,
+            "UPI ID": upi_id,
+            "Transaction ID": transaction_id,
+            "UPI Ref No": upi_ref,
+            "Date & Time": date_time
+        }
+
+    else:
+        header = f"{category} Receipt Summary"
+        for line in lines:
+            if ":" in line:
+                key, value = line.split(":", 1)
+                fields[key.strip().title()] = value.strip()
+            elif re.search(r'₹\s?\d+(\.\d+)?', line):
+                fields["Amount"] = line.strip()
+            elif re.search(r'\d{2}[-/]\d{2}[-/]\d{4}', line):
+                fields["Date"] = line.strip()
+            else:
+                others.append(line.strip())
+
+    result += f"🧾 *{header}*\n\n"
     result += f"🗂️ *Category:* `{category}`\n\n"
-
     if fields:
-        result += "🔍 *Detected Fields:*\n"
+        result += "🔍 *Extracted Details:*\n"
         for k, v in fields.items():
-            result += f"• {k}: {v}\n"
-        result += "\n"
-
+            if v:
+                result += f"• {k}: {v}\n"
     if others:
-        result += "📋 *Other Info:*\n"
+        result += "\n📋 *Other Info:*\n"
         for line in others:
-            result += f"- {line}\n"
+            if len(line.strip()) > 2:
+                result += f"- {line}\n"
 
     return result.strip()
 
-# App entry point
+# Receipt type handler
+async def handle_receipt_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        query = update.callback_query
+        await query.answer()
+        receipt_type = query.data
+        user_id = query.from_user.id
+
+        if user_id not in user_images:
+            await query.edit_message_text("❌ No image found. Please send again.")
+            return
+
+        image_bytes = user_images.pop(user_id)
+        image_stream = BytesIO(image_bytes)
+        text = extract_text_from_image(image_stream)
+
+        if not text:
+            await query.edit_message_text(
+                "❗ *Unable to read the text clearly from the image.*\n"
+                "📸 Please send a properly captured, clear image of the receipt for best results.",
+                parse_mode='Markdown'
+            )
+            return
+
+        formatted = organize_text(text, receipt_type)
+        if not formatted:
+            await query.edit_message_text(
+                "⚠️ *The image seems blurry or unclear.*\n"
+                "📷 Kindly upload a clear, readable image of the receipt to extract details.",
+                parse_mode='Markdown'
+            )
+            return
+
+        await query.edit_message_text(f"{formatted}", parse_mode='Markdown')
+
+    except Exception as e:
+        logging.error(f"ReceiptType Error: {e}")
+        await query.edit_message_text("❌ Error occurred. Please retry.")
+
+# Main
 if __name__ == "__main__":
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(CallbackQueryHandler(handle_receipt_type))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))  # Handles text fallback
-    print("🤖 Bariflo OCR bot is running...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))  # fallback
+    print("✅ Telegram OCR bot is live...")
     app.run_polling()
