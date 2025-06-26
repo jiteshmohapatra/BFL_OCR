@@ -5,7 +5,13 @@ import logging
 import requests
 from io import BytesIO
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import (
+    Update,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -29,13 +35,22 @@ logging.basicConfig(level=logging.INFO)
 user_images = {}
 user_state = {}
 
-# Start command
+# Start command with visible "Start" button
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("\U0001F4F8 Send a receipt image (UPI, handwritten, printed, brochure)")
+    keyboard = [["start"]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    
+    await update.message.reply_text(
+        "\U0001F4F8 Send a receipt image (UPI, handwritten, printed, brochure)",
+        reply_markup=reply_markup
+    )
 
 # Handle image upload
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Remove custom keyboard when image is received
+        await update.message.reply_text("🖼️ Image received. Processing...", reply_markup=ReplyKeyboardRemove())
+
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         file_bytes = await file.download_as_bytearray()
@@ -79,6 +94,37 @@ def extract_text_from_image(image_stream):
     return "\n".join(lines)
 
 # Field extraction by category
+# def extract_limited_fields(text, category):
+#     lines = text.splitlines()
+#     fields = {
+#         "Amount": "",
+#         "Date & Time": "",
+#         "Transaction ID": "",
+#         "Person Name": "",
+#         "UPI ID": ""  # Only for Paytm
+#     }
+
+#     for line in lines:
+#         if not fields["Amount"] and re.search(r'₹\s?\d+[\d,.]*', line):
+#             fields["Amount"] = line.strip()
+#         elif not fields["Date & Time"] and re.search(r'\d{1,2}[:.]\d{2}.*\d{2,4}', line):
+#             fields["Date & Time"] = line.strip()
+#         elif not fields["Transaction ID"] and re.match(r'^[A-Z0-9]{12,}$', line):
+#             fields["Transaction ID"] = line.strip()
+#         elif not fields["Person Name"] and re.search(r'(To|Paid to|To:|Paid to:)', line, re.IGNORECASE):
+#             fields["Person Name"] = re.sub(r'(To|Paid to|To:|Paid to:)\s*', '', line, flags=re.IGNORECASE).strip()
+#         elif category == "Paytm" and not fields["UPI ID"] and "@" in line:
+#             upi_match = re.search(r"\b[\w.-]+@[\w.-]+\b", line)
+#             if upi_match:
+#                 fields["UPI ID"] = upi_match.group(0).strip()
+
+#     result = f"\U0001F50D *Extracted Details for {category}:*\n"
+#     for key, value in fields.items():
+#         if category != "Paytm" and key == "UPI ID":
+#             continue
+#         result += f"• {key}: {value or 'Not Found'}\n"
+#     return result.strip()
+
 def extract_limited_fields(text, category):
     lines = text.splitlines()
     fields = {
@@ -89,19 +135,40 @@ def extract_limited_fields(text, category):
         "UPI ID": ""  # Only for Paytm
     }
 
-    for line in lines:
+    paid_to_index = -1
+
+    for i, line in enumerate(lines):
+        line = line.strip()
         if not fields["Amount"] and re.search(r'₹\s?\d+[\d,.]*', line):
-            fields["Amount"] = line.strip()
+            fields["Amount"] = line
+
         elif not fields["Date & Time"] and re.search(r'\d{1,2}[:.]\d{2}.*\d{2,4}', line):
-            fields["Date & Time"] = line.strip()
-        elif not fields["Transaction ID"] and re.match(r'^[A-Z0-9]{12,}$', line):
-            fields["Transaction ID"] = line.strip()
-        elif not fields["Person Name"] and re.search(r'(To|Paid to|To:|Paid to:)', line, re.IGNORECASE):
-            fields["Person Name"] = re.sub(r'(To|Paid to|To:|Paid to:)\s*', '', line, flags=re.IGNORECASE).strip()
+            fields["Date & Time"] = line
+
+        elif not fields["Transaction ID"] and re.match(r'^T[0-9A-Z]{20,}$', line):
+            fields["Transaction ID"] = line
+
+        elif not fields["Person Name"]:
+            # Direct match like "Paid to: XYZ"
+            match = re.search(r'(To|Paid to|To:|Paid to:|To-)\s*(.+)', line, re.IGNORECASE)
+            if match and len(match.group(2).strip()) > 2:
+                fields["Person Name"] = match.group(2).strip()
+            elif "Paid to" in line and i + 1 < len(lines):
+                paid_to_index = i + 1
+
         elif category == "Paytm" and not fields["UPI ID"] and "@" in line:
             upi_match = re.search(r"\b[\w.-]+@[\w.-]+\b", line)
             if upi_match:
                 fields["UPI ID"] = upi_match.group(0).strip()
+
+    # Use next valid line if "Paid to" was on its own
+    if not fields["Person Name"] and paid_to_index != -1:
+        for j in range(paid_to_index, len(lines)):
+            possible_name = lines[j].strip()
+            if (len(possible_name) > 2 and
+                not re.search(r'@|T[0-9A-Z]{10,}|UTR|debited|bank|account|₹', possible_name, re.IGNORECASE)):
+                fields["Person Name"] = possible_name
+                break
 
     result = f"\U0001F50D *Extracted Details for {category}:*\n"
     for key, value in fields.items():
@@ -165,6 +232,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, start))  # fallback to restart
     print("✅ Bot is running...")
     app.run_polling()
